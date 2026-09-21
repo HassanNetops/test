@@ -1,0 +1,266 @@
+"""SNMP lifecycle, credential handling, and shell opt-in decision table."""
+
+from __future__ import annotations
+
+import copy
+import logging
+from unittest.mock import MagicMock
+
+import httpx
+import pytest
+
+from scm_auto.client.http import HttpClient
+from scm_auto.engine.executor import Executor
+from scm_auto.exceptions import APIError, IntentSchemaError
+from scm_auto.handlers.sdwan.devices.snmp import SnmpAgentHandler
+from scm_auto.handlers.sdwan_base import KNOWN_AFTER_APPLY
+from scm_auto.orchestrators.device_orchestrator import DeviceOrchestrator
+from scm_auto.redaction import redact_secrets
+
+
+def intent(**extra):
+    return {
+        "site_id": "site1", "element_id": "element1", "_is_element_shell": False,
+        "description": "Lab polling",
+        "v3_config": {"enabled": True, "users_access": [{
+            "user_name": "monitor", "security_level": "PRIVATE",
+            "auth_type": "SHA", "enc_type": "AES",
+            "auth_phrase": "auth-test-phrase", "enc_phrase": "priv-test-phrase",
+        }]}, **extra,
+    }
+
+
+class Controller:
+    """In-memory API wire fixture: items list, detail object, masked secrets."""
+
+    def __init__(self):
+        self.current = None
+        self.calls = []
+
+    def request(self, method, path, **kwargs):
+        body = copy.deepcopy(kwargs.get("json"))
+        self.calls.append((method, path, body))
+        if method == "GET":
+            if path.endswith("/snmpagents"):
+                return {"items": [{"id": "agent1"}] if self.current else []}
+            return copy.deepcopy(self.current)
+        if method in {"POST", "PUT"}:
+            assert "name" not in body
+            assert not any(k.startswith("_allow") or k.startswith("_is_") for k in body)
+            if method == "PUT":
+                assert body["_etag"] == self.current["_etag"]
+            self.current = {**copy.deepcopy(body), "id": "agent1", "_etag": (self.current or {}).get("_etag", 0) + 1}
+            for user in self.current["v3_config"]["users_access"]:
+                user["auth_phrase"] = "*****"
+                user["enc_phrase"] = "*****"
+            return copy.deepcopy(self.current)
+        if method == "DELETE":
+            self.current = None
+            return {}
+        raise AssertionError(method)
+
+    @property
+    def writes(self):
+        return [call for call in self.calls if call[0] != "GET"]
+
+
+def test_real_handler_lifecycle_and_readback():
+    client = Controller()
+    handler = SnmpAgentHandler(client)
+    payload = intent()
+    original = copy.deepcopy(payload)
+    plan = handler.check(payload)
+    assert plan.action == "created"
+    assert "auth-test-phrase" not in plan.model_dump_json()
+    assert "auth_phrase" not in plan.model_dump_json()
+    assert client.writes == []
+    assert handler.ensure(payload).action == "created"
+    assert handler.check(payload).action == "unchanged"
+    assert handler.ensure(payload).action == "unchanged"
+    assert len(client.writes) == 1
+    assert payload == original
+    assert handler.ensure(intent(description="Updated")).action == "updated"
+    assert handler.remove(payload).action == "deleted"
+    assert handler.remove(payload).action == "skipped"
+
+
+@pytest.mark.parametrize("shell,allow,expected", [
+    (False, False, "created"), (True, False, "skipped"), (True, True, "created"),
+])
+def test_shell_decision_table(shell, allow, expected):
+    client = Controller()
+    handler = SnmpAgentHandler(client)
+    payload = intent(_is_element_shell=shell, _allow_shell=allow)
+    assert handler.check(payload).action == expected
+    assert not client.writes
+    assert handler.ensure(payload).action == expected
+    if expected == "skipped":
+        assert not client.calls
+    else:
+        assert client.writes[0][1] == "/sdwan/v2.1/api/sites/site1/elements/element1/snmpagents"
+
+
+def test_controller_shell_refusal_is_failure_not_skip_and_does_not_echo_secret():
+    client = MagicMock()
+    client.request.side_effect = APIError("echo auth-test-phrase", 400, {
+        "_error": [{"code": "ELEMENT_NOT_BOUND", "message": "auth-test-phrase"}]
+    })
+    results, errors = Executor().execute(
+        SnmpAgentHandler(client), [intent(_is_element_shell=True, _allow_shell=True)], "apply"
+    )
+    assert results[0].action == "failed"
+    assert "ELEMENT_NOT_BOUND" in errors[0]
+    assert "auth-test-phrase" not in str(errors)
+
+
+def test_secret_rotation_reported_without_values():
+    client = Controller()
+    handler = SnmpAgentHandler(client)
+    handler.ensure(intent())
+    payload = intent(_update_secrets=True)
+    payload["v3_config"]["users_access"][0]["auth_phrase"] = "new-auth-phrase"
+    plan = handler.check(payload)
+    assert plan.action == "updated"
+    assert "rotate" in plan.detail
+    assert "new-auth-phrase" not in plan.model_dump_json()
+    assert handler.ensure(payload).action == "updated"
+    assert client.writes[-1][2]["v3_config"]["users_access"][0]["auth_phrase"] == "new-auth-phrase"
+    assert "_update_secrets" not in client.writes[-1][2]
+
+
+def test_users_reorder_no_drift_and_replacement_no_inherited_engine_id():
+    client = Controller()
+    handler = SnmpAgentHandler(client)
+    payload = intent()
+    users = payload["v3_config"]["users_access"]
+    users[0]["engine_id"] = "engine-a"
+    users.append({**users[0], "user_name": "second", "engine_id": "engine-b"})
+    handler.ensure(payload)
+    payload["v3_config"]["users_access"].reverse()
+    assert handler.ensure(payload).action == "unchanged"
+    replacement = intent()
+    replacement["v3_config"]["users_access"][0]["user_name"] = "replacement"
+    assert handler.ensure(replacement).action == "updated"
+    sent = client.writes[-1][2]["v3_config"]["users_access"]
+    assert len(sent) == 1
+    assert "engine_id" not in sent[0]
+
+
+@pytest.mark.parametrize("secret", ["", "*****", "REPLACE_VIA_ENV", "_replace_from_env_MISSING", None])
+def test_invalid_secrets_never_written(secret):
+    client = Controller()
+    payload = intent()
+    payload["v3_config"]["users_access"][0]["auth_phrase"] = secret
+    with pytest.raises(IntentSchemaError, match="resolved secret"):
+        SnmpAgentHandler(client).ensure(payload)
+    assert not client.writes
+
+
+@pytest.mark.parametrize("response", [None, {}, {"items": [{"id": "a"}, {"id": "b"}]}, {"items": [{}]}])
+def test_ambiguous_or_malformed_list_never_creates(response):
+    client = MagicMock()
+    client.request.return_value = response
+    with pytest.raises(IntentSchemaError):
+        SnmpAgentHandler(client).ensure(intent())
+    assert all(c.args[0] == "GET" for c in client.request.call_args_list)
+
+
+def test_missing_etag_refuses_update():
+    client = Controller()
+    handler = SnmpAgentHandler(client)
+    handler.ensure(intent())
+    del client.current["_etag"]
+    with pytest.raises(IntentSchemaError, match="_etag"):
+        handler.ensure(intent(description="Changed"))
+    assert len(client.writes) == 1
+
+
+def test_pending_element_dry_run_no_api_calls():
+    client = Controller()
+    result = SnmpAgentHandler(client).check(intent(element_id=KNOWN_AFTER_APPLY))
+    assert result.action == "created"
+    assert not client.calls
+    assert "auth-test-phrase" not in result.model_dump_json()
+
+
+def test_http_debug_logs_omit_snmp_credentials_and_response_text(caplog):
+    caplog.set_level(logging.DEBUG)
+    client = HttpClient(auth=httpx.Auth(), base_url="https://lab.invalid")
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"message": "auth-test-phrase priv-test-phrase"})
+    ), base_url="https://lab.invalid")
+    with client:
+        client.post("/sdwan/v2.1/api/sites/s/elements/e/snmpagents", json=intent())
+    assert "auth-test-phrase" not in caplog.text
+    assert "priv-test-phrase" not in caplog.text
+    assert redact_secrets({"auth_phrase": "private", "enc_phrase": "private"}) == {
+        "auth_phrase": "***", "enc_phrase": "***",
+    }
+
+
+@pytest.mark.parametrize("shell", [False, True])
+def test_device_orchestrator_dispatches_real_handler(shell):
+    client = Controller()
+    device = {
+        "name": "ION-LAB", "site_id": "site1", "is_element_shell": shell,
+        "snmp_agents": [{k: v for k, v in intent(_allow_shell=True).items()
+                         if k not in {"site_id", "element_id", "_is_element_shell"}}],
+    }
+    element = {"name": "ION-LAB", "id": "element1", "site_id": "site1",
+               "hw_id": "SHELL#shell1" if shell else "hardware1"}
+    def listing(path):
+        if path.endswith("elementshells"):
+            return [{"id": "shell1", "name": "ION-LAB"}] if shell else []
+        if path.endswith("elements"):
+            return [element]
+        raise AssertionError(path)
+    client.list = listing
+    result = DeviceOrchestrator(client).run([device], "apply")
+    assert result.success
+    assert any(r.resource_type == "ION-LAB/snmp_agents" and r.action == "created" for r in result.results)
+    assert len(client.writes) == 1
+    assert all(call[1].endswith("snmpagents") for call in client.writes)
+
+
+def test_duplicate_intent_entries_fail_before_any_calls():
+    client = MagicMock()
+    with pytest.raises(IntentSchemaError):
+        DeviceOrchestrator(client).run([{"snmp_agents": [intent(), intent()]}], "apply")
+    assert client.mock_calls == []
+
+
+@pytest.mark.parametrize("legacy", [None, {"enabled": False}, {"enabled": True}])
+@pytest.mark.parametrize("operation", ["check", "ensure"])
+def test_non_v3_configuration_is_rejected(legacy, operation):
+    client = Controller()
+    with pytest.raises(IntentSchemaError, match="SNMPv3-only"):
+        getattr(SnmpAgentHandler(client), operation)(intent(v2_config=legacy))
+    assert not client.calls
+
+
+def test_only_v3_fields_sent_on_create_and_update_even_with_legacy_readback():
+    client = Controller()
+    handler = SnmpAgentHandler(client)
+    assert handler.ensure(intent()).action == "created"
+    client.current["v2_config"] = {"enabled": True, "community": "legacy-test-secret"}
+    assert handler.check(intent()).action == "unchanged"
+    result = handler.check(intent(description="Changed"))
+    assert "legacy-test-secret" not in result.model_dump_json()
+    assert handler.ensure(intent(description="Changed")).action == "updated"
+    for _, _, body in client.writes:
+        assert "v2_config" not in body
+        assert "community" not in str(body)
+        assert body["v3_config"]["enabled"] is True
+
+
+@pytest.mark.parametrize("level", ["top", "config", "user"])
+def test_unsupported_fields_rejected_without_api_calls(level):
+    payload = intent()
+    node = {"top": payload, "config": payload["v3_config"],
+            "user": payload["v3_config"]["users_access"][0]}[level]
+    node["unexpected"] = "value"
+    client = Controller()
+    with pytest.raises(IntentSchemaError, match="Unsupported field"):
+        SnmpAgentHandler(client).ensure(payload)
+    assert not client.calls
