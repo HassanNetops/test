@@ -1,0 +1,11 @@
+# Validate every SNMP entry before any element or child writes.
+        for device in devices:
+            entries = device.get("snmp_agents", [])
+            if (not isinstance(entries, list) or len(entries) > 1
+                    or any(not isinstance(entry, dict) for entry in entries)):
+                raise IntentSchemaError("snmp_agents must contain at most one configuration per device")
+            for entry in entries:
+                if type(entry.get("_allow_shell", False)) is not bool:
+                    raise IntentSchemaError("SNMP _allow_shell must be boolean")
+                if mode != "delete":
+                    SnmpAgentHandler.validate(entry)
