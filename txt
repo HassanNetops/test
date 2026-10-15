@@ -1,0 +1,116 @@
+{
+  "sdwan": {
+    "dhcp_servers": [
+      {
+        "subnet": "192.168.6.0/24",
+        "description": "DHCP server on port 7 — LAN, GB-HNC-SMCPLX-000000 ",
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "192.168.6.1",
+        "dns_servers": ["8.8.8.8", "8.8.4.4"],
+        "ip_ranges": [
+          { "start_ip": "192.168.6.100", "end_ip": "192.168.6.200" }
+        ]
+      },
+      {
+        "subnet": "10.97.0.0/24",
+        "description": "VLAN 200 — DATA (po1.200, HA pair SDW01/SDW02)",
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.0.1",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.0.10", "end_ip": "10.97.0.254" }
+        ]
+      },
+      {
+        "subnet": "10.97.5.0/26",
+        "description": "VLAN 212 — Facilities (po1.212, HA pair SDW01/SDW02
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.5.1",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.5.10", "end_ip": "10.97.5.62" }
+        ]
+      },
+      {
+        "subnet": "10.97.5.192/26",
+        "description": "VLAN 215 — Medical devices (po1.215, HA pair SDW01/
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.5.193",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.5.202", "end_ip": "10.97.5.254" }
+        ]
+      },
+      {
+        "subnet": "10.97.2.0/24",
+        "description": "VLAN 229 — Corp_Wifi (po1.229, HA pair SDW01/SDW02)
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.2.1",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.2.10", "end_ip": "10.97.2.254" }
+        ]
+      },
+      {
+        "subnet": "10.97.3.0/24",
+        "description": "VLAN 230 — Guest_Wifi (po1.230, HA pair SDW01/SDW02
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.3.1",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.3.10", "end_ip": "10.97.3.254" }
+        ]
+      },
+      {
+        "subnet": "10.97.4.0/25",
+        "description": "VLAN 231 — Bupa_eCommerce (po1.231, HA pair SDW01/S
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.4.1",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.4.10", "end_ip": "10.97.4.126" }
+        ]
+      },
+      {
+        "subnet": "10.97.4.128/25",
+        "description": "VLAN 232 — Bupa-Devices_Wifi (po1.232, HA pair SDW0
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.4.129",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.4.138", "end_ip": "10.97.4.254" }
+        ]
+      },
+      {
+        "subnet": "10.97.6.0/26",
+        "description": "VLAN 400 — IPTV (po1.400, HA pair SDW01/SDW02)",
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.6.1",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.6.10", "end_ip": "10.97.6.62" }
+        ]
+      },
+      {
+        "subnet": "10.97.8.0/24",
+        "description": "VLAN 666 — NAC (po1.666, HA pair SDW01/SDW02)",
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.8.1",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.8.10", "end_ip": "10.97.8.254" }
+        ]
+      },
+      {
+        "subnet": "10.97.1.0/24",
+        "description": "VLAN 700 — VOICE (po1.700, HA pair SDW01/SDW02)",
+        "_ref_site_name": "GB-HNC-SMCPLX-000000",
+        "gateway": "10.97.1.1",
+        "dns_servers": ["8.8.8.8", "1.1.1.1"],
+        "ip_ranges": [
+          { "start_ip": "10.97.1.10", "end_ip": "10.97.1.254" }
+        ]
+      }
+    ]
+  }
+}
