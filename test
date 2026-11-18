@@ -1,0 +1,86 @@
+On a 1200-S, a port 7 LAN trunk is one switch_port interface entry plus one vlan (SVI) entry per VLAN. It replaces the po1 + po1.X sub-interface pattern the repo uses on the 3200s. The SDK already passes both types through on apply, but it needs two small fixes and one live check before first use. I changed no repo files.
+
+How the 1200-S differs
+
+┌─────────────────┬──────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────┐
+│                 │                              ION 1200-S                              │                 ION 3200 (as used in the repo)                 │
+├─────────────────┼──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ Ports 1–4       │ Routed ports (1–2 are RJ45/SFP combo), bypass pair on 3/4            │ Same                                                           │
+├─────────────────┼──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ Ports 5–10      │ Fixed L2 switch ports, type: switch_port, PoE on four of them (90 W  │ Routed ports by default (L3 mode), which is why po1 on 9/10    │
+│                 │ budget)                                                              │ works                                                          │
+├─────────────────┼──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ LAN gateways    │ SVIs, type: vlan                                                     │ Sub-interfaces on a port or port-channel                       │
+├─────────────────┼──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ Mode            │ Always a switch platform                                             │ L3 by default; switching it to L2 mode makes it behave like a  │
+│                 │                                                                      │ 1200-S                                                         │
+├─────────────────┼──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ Minimum         │ 6.0.2                                                                │ 6.3.1 for L2 mode                                              │
+│ software        │                                                                      │                                                                │
+└─────────────────┴──────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────┘
+
+- Limits: 32 active VLANs, VLAN IDs 1–4000. The HNC VLAN set (16 VLANs, highest 997) fits.
+- Spanning tree: the built-in switch runs RSTP/MSTP, and Palo Alto says neighbouring switches must not run PVST.
+- HA: Palo Alto's design uses the same LAN SVI IPs on both units, a unique HA SVI IP, and interface tracking on the trunk port.
+- Factory state: ports 5–10 are in access mode, and a vlan1 SVI exists but is admin-down.
+
+What goes in the intent
+
+In the device's interfaces array in sdwan_devices.json, add one SVI per VLAN and then the trunk port:
+
+{
+  "name": "vlan-100", "type": "vlan", "admin_up": true,
+  "description": "VLAN 100 — Management",
+  "scope": "global", "used_for": "lan",
+  "vlan_config": { "vlan_id": 100, "voice_enabled": false, "mstp_instance": 0 },
+  "ipv4_config": { "type": "static", "static_config": { "address": "10.97.7.1/27" } }
+},
+{
+  "name": "vlan-20", "type": "vlan", "admin_up": true,
+  "description": "SDW HA — control link",
+  "scope": "local", "used_for": "ha",
+  "vlan_config": { "vlan_id": 20, "voice_enabled": false, "mstp_instance": 0 },
+  "ipv4_config": { "type": "static", "static_config": { "address": "10.159.134.209/30" } }
+},
+{
+  "name": "7", "type": "switch_port", "admin_up": true,
+  "description": "LAN trunk to access switch",
+  "switch_port_config": {
+    "vlan_mode": "trunk",
+    "trunk_vlans": ["20", "100", "200"],
+    "native_vlan_id": 100
+  }
+}
+
+- VLAN references are plain numbers. trunk_vlans is a list of strings and native_vlan_id is a number; neither is an interface ID, so no new _ref_ resolver is needed.
+- Port 7 needs only the fields you manage. The switch port always exists, so the SDK merges your keys onto the live object and keeps the rest (STP, storm control, used_for).
+- HA follows the SVI name. spoke_ha_config.source_interface becomes "vlan-20", and tracking is { "_ref_interface_name": "7", "reduce_priority": <that device's priority> }.
+- Nothing else moves. DHCP servers are keyed by subnet and zones resolve interfaces by name. The deploy repo has no intent schema that would reject the new types.
+
+What the SDK review found
+
+I ran the interface handler against a fake client modelled on the 1200-S factory defaults (no tenant calls). The trunk PUT and SVI POST went through, and a second run was a clean no-op. Two things need fixing:
+
+1. Ordering (src/scm_auto/orchestrators/device_orchestrator.py:64): vlan and switch_port both fall in bucket 2, so the trunk is applied before its SVIs if the intent lists it first. Adding "switch_port": 3 to _INTERFACE_TYPE_BUCKET fixes it.
+2. Delete (src/scm_auto/handlers/sdwan/devices/interfaces.py:222): remove() sends a DELETE for the switch port, which cannot be deleted. It needs a branch that PUTs the port back to access mode with its VLANs cleared, so the SVI deletes that follow are allowed.
+
+docs/intent-format.md:695 would also need the two new types added.
+
+Not yet confirmed against a live controller
+
+- SVI create defaults: the SDK posts its generic defaults, including a populated multicast_config. That same field was rejected for bypass pairs, so the first SVI create may return a 400.
+- trunk_vlans order: the SDK compares lists in exact order. If the controller re-orders them, every run will show a change on port 7.
+- Names and strings: the exact SVI name the controller stores, the used_for value on a trunk port, and the model_name string for a 1200-S shell.
+- LACP on switch ports: I found nothing in Palo Alto's docs on bundling two switch ports, so I can't say whether a two-port trunk is possible.
+
+The WORC ION already runs this layout (port 7 trunk, native 100, SVIs). The interface JSON for its port 7 and one SVI, or a photo of it, would settle the first three points. With that I can write the two fixes and their tests against the real payload.
+
+Sources:
+- Configure Layer 2 Switch Ports (https://docs.paloaltonetworks.com/prisma-sd-wan/administration/prisma-sd-wan-sites-and-devices/configure-layer-2-switch-ports)
+- Configure VLAN on Switch Ports (https://docs.paloaltonetworks.com/prisma/prisma-sd-wan/prisma-sd-wan-admin/prisma-sd-wan-sites-and-devices/configure-layer-2-switch-ports/configure-vlan-on-switch-ports)
+- Add a VLAN or Switch Virtual Interface (SVI) (https://docs.paloaltonetworks.com/prisma/prisma-sd-wan/prisma-sd-wan-admin/prisma-sd-wan-sites-and-devices/configure-layer-2-switch-ports/add-a-vlan-or-switch-virtual-interface)
+- Switch Layer 2/Layer 3 Change Mode (https://docs.paloaltonetworks.com/prisma-sd-wan/administration/prisma-sd-wan-sites-and-devices/configure-layer-2-switch-ports/switch-layer-2-layer3-change-mode)
+- Configure Branch HA with Gen-2 Embedded Switch Platforms (1200-S or 3200-L2) (https://docs.paloaltonetworks.com/prisma-sd-wan/administration/prisma-sd-wan-branch-high-availability/branch-ha-topologies-platforms/configure-branch-ha-gen2-embedded-switch-platforms)
+- ION 1200-S Hardware Specifications (https://docs.paloaltonetworks.com/hardware/ion-1200-s-hardware-reference/ion-1200-s-overview/ion-1200-s-hardware-specifications)
+- Terraform provider: prismasdwan_element_interface (https://github.com/PaloAltoNetworks/terraform-provider-prismasdwan/blob/main/docs/resources/element_interface.md)
+- cloudgenix_config default interface templates (https://github.com/CloudGenix/cloudgenix_config/blob/master/cloudgenix_config/default_interfaces.py)
