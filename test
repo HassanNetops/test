@@ -1,0 +1,82 @@
+Short answer: at site level you don't bind to 34 or port 1 at all, and nothing is 1200-S-specific on the WAN side. A site-level binding attaches a zone to circuits, and 34 and port 1 inherit it from the circuit they already carry. sdwan_devices.json needs no change, but the SDK needs a small extension before it can name a circuit in a zone binding.
+
+Intent change
+
+Add one entry (by your convention, a new sdwan_site_security_zones.json in the Fulham folder):
+
+{
+  "sdwan": {
+    "site_security_zones": [
+      {
+        "_ref_site_name": "GB-MPL-FULHAM-225938",
+        "_ref_zone_name": "<your WAN zone name>",
+        "_ref_waninterface_names": ["primary-internet", "secondary-internet"]
+      }
+    ]
+  }
+}
+
+Because the circuits are crossed, this one object covers 34 and port 1 on both IONs. The zone must exist under security_zones; I have never seen your Fulham sdwan_security_zones.json, so the zone name is a placeholder.
+
+SDK change (required)
+
+SiteSecurityZoneHandler only understands _ref_lannetwork_names today. With the current SDK, _ref_waninterface_names is sent to the controller verbatim, which the API spec says it rejects as an extra attribute (I saw the SDK send it; the rejection is from the spec, not observed).
+
+Two edits in rhizo-pan-tools-monorepo:
+
+1. src/scm_auto/handlers/sdwan/core/site_security_zones.py — resolve circuit names to wan_network entries:
+
+_NETWORK_REFS: dict[str, tuple[str, str]] = {
+    "_ref_waninterface_names": ("/sdwan/v2.10/api/sites/{site_id}/waninterfaces", "wan_network"),
+    "_ref_lannetwork_names": ("/sdwan/v3.3/api/sites/{site_id}/lannetworks", "lan_network"),
+}
+
+    def _resolve_refs(self, payload):
+        resolved = super()._resolve_refs(payload)
+        present = [key for key in _NETWORK_REFS if key in resolved]
+        if not present:
+            return resolved
+        site_id = resolved.get("site_id", "")
+        site_name = payload.get("_ref_site_name")
+        networks = []
+        for key in present:
+            template, network_type = _NETWORK_REFS[key]
+            for name in resolved.pop(key):
+                networks.append({
+                    "network_id": self._resolve_site_child(template, site_id, site_name, name),
+                    "network_type": network_type,
+                })
+        resolved["networks"] = networks
+        return resolved
+
+    def _resolve_site_child(self, template, site_id, site_name, name):
+        if site_id == KNOWN_AFTER_APPLY:
+            return KNOWN_AFTER_APPLY
+        try:
+            return self._lookup_ref(template.format(site_id=site_id), name)
+        except RefResolutionError:
+            bucket = (self._plan_names or {}).get(template)
+            if isinstance(bucket, dict) and name in bucket.get((site_name,), set()):
+                return KNOWN_AFTER_APPLY
+            raise
+
+2. src/scm_auto/orchestrators/sdwan_orchestrator.py:134 — add "wan_interfaces" to the site_security_zones dependencies, so the binding is deleted before the circuits in delete mode.
+
+I tested this on a scratch copy against a fake controller: create, idempotent re-run, update, delete order, and a dry-run with circuits in the same PR all behave, and all 795 unit tests pass. Your local repos are untouched.
+
+No-SDK-change alternative: a raw "networks": [{"network_id": "<circuit id>", "network_type": "wan_network"}] list with literal circuit IDs works on the current SDK (also tested), but you have to copy the IDs from the controller.
+
+Things to know before applying
+
+- Unbound traffic is dropped. Once a security policy is attached to the site, PAN says anything not bound to a zone is blocked. Binding only the WAN circuits would cut LAN and Prisma Access tunnel traffic unless those get zones too.
+- Device-level wins on conflict. PAN recommends device-level binding, but for this crossed-bypass design I'd keep site-level: one object instead of a block per ION.
+- Where the 1200-S does matter is LAN. Zones there would go on the SVIs at device level, not on switch ports 5–10. PAN's published list of bindable interface types doesn't mention SVIs and excludes controller (HA) interfaces, so check that on the live tenant first.
+
+The full patched handler is in the session scratchpad (temporary) at /private/tmp/claude-501/-Users-hassan-Desktop-Paloalto-automation/7a69fc0a-3f3a-4631-ab3d-0cdff9d4eb93/scratchpad/sdkcopy/src/scm_auto/handlers/sdwan/core/site_security_zones.py. Say the word and I'll write both files into the local SDK repo so you can paste them whole.
+
+Sources:
+- Bind Security Zones to Sites (https://docs.paloaltonetworks.com/prisma/prisma-sd-wan/prisma-sd-wan-admin/prisma-sd-wan-stacked-security-policies/bind-security-zones-to-sites-and-devices/bind-stacked-security-zones-to-sites)
+- Bind Security Zones to Interfaces (https://docs.paloaltonetworks.com/prisma/prisma-sd-wan/prisma-sd-wan-admin/prisma-sd-wan-stacked-security-policies/bind-security-zones-to-sites-and-devices/bind-stacked-security-zones-to-interfaces)
+- Bind Zones to Sites and Devices (https://docs.paloaltonetworks.com/prisma-sd-wan/administration/prisma-sd-wan-stacked-security-policies/prisma-sd-wan-security-policies/configure-security-policies/bind-zones-to-sites-and-devices)
+- Prisma SD-WAN unified OpenAPI spec (https://raw.githubusercontent.com/PaloAltoNetworks/pan.dev/master/openapi-specs/sdwan/unified/open_api_unified.json)
+- cloudgenix_config do.py (https://raw.githubusercontent.com/CloudGenix/cloudgenix_config/master/cloudgenix_config/do.py)
